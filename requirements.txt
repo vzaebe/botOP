@@ -1,0 +1,6 @@
+python-telegram-bot[asyncio]==20.7
+python-dotenv>=1.0.0
+aiosqlite>=0.19.0
+pandas>=2.1.0
+openpyxl>=3.1.2
+typing-extensions>=4.8.0
