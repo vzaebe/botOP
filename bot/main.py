@@ -1,5 +1,5 @@
 from __future__ import annotations
-from telegram.ext import Application, ApplicationBuilder, MessageHandler, filters
+from telegram.ext import Application, ApplicationBuilder
 
 from .config import load_config
 from .logging_config import setup_logging
@@ -9,9 +9,11 @@ from .storage.repositories.roles import RoleRepository
 from .storage.repositories.events import EventRepository
 from .storage.repositories.registrations import RegistrationRepository
 from .storage.repositories.content import ContentRepository
+from .storage.repositories.nodes import NodeRepository
 from .services.profiles import ProfileService
 from .services.events import EventService
 from .services.content import ContentService
+from .services.nodes import NodeService
 from .constants import Role
 from .services.migrations import MigrationService
 from .services.restart import RestartService
@@ -20,6 +22,7 @@ from .handlers import profile as profile_handlers
 from .handlers import events as events_handlers
 from .handlers import admin as admin_handlers
 from .handlers import content as content_handlers
+from .handlers import menu as menu_handlers
 from .services.messaging import send_main_menu
 from .utils.errors import PermissionDenied
 import logging
@@ -34,6 +37,8 @@ async def on_startup(app: Application):
     await migrator.migrate_from_files()
     content_service: ContentService = app.bot_data["content_service"]
     await content_service.ensure_defaults()
+    node_service: NodeService = app.bot_data["node_service"]
+    await node_service.ensure_defaults()
     app.bot_data["restart_service"] = RestartService(enabled=True)
     # grant admin roles from config
     profile_service = app.bot_data["profile_service"]
@@ -41,10 +46,6 @@ async def on_startup(app: Application):
         # гарантируем запись пользователя, иначе FK на roles упадёт
         await profile_service.ensure_user(admin_id, username="", full_name=f"admin-{admin_id}")
         await profile_service.assign_role(admin_id, Role.ADMIN)
-
-
-async def fallback_menu(update, context):
-    await send_main_menu(context, update.effective_chat.id, text="Выберите действие:")
 
 
 async def on_error(update, context):
@@ -66,10 +67,12 @@ def build_application() -> Application:
     event_repo = EventRepository(db)
     reg_repo = RegistrationRepository(db)
     content_repo = ContentRepository(db)
+    node_repo = NodeRepository(db)
 
     profile_service = ProfileService(user_repo, role_repo)
     event_service = EventService(event_repo, reg_repo)
     content_service = ContentService(content_repo)
+    node_service = NodeService(node_repo)
     migrator = MigrationService(user_repo, role_repo, event_repo, reg_repo, content_repo)
 
     app = (
@@ -84,6 +87,7 @@ def build_application() -> Application:
     app.bot_data["profile_service"] = profile_service
     app.bot_data["event_service"] = event_service
     app.bot_data["content_service"] = content_service
+    app.bot_data["node_service"] = node_service
     app.bot_data["migrator"] = migrator
     app.bot_data["role_service"] = profile_service  # reuse profile service for role ops
     app.bot_data["restart_service"] = RestartService(enabled=True)
@@ -93,9 +97,7 @@ def build_application() -> Application:
     events_handlers.setup_handlers(app)
     admin_handlers.setup_handlers(app)
     content_handlers.setup_handlers(app)
-
-    # Fallback to show menu for unknown text
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_menu))
+    menu_handlers.setup_handlers(app)
     app.add_error_handler(on_error)
     logger.info("Bot initialized")
     return app

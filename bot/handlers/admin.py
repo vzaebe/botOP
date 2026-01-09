@@ -9,6 +9,7 @@ import pandas as pd
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ContextTypes,
+    CommandHandler,
     CallbackQueryHandler,
     ConversationHandler,
     MessageHandler,
@@ -16,11 +17,28 @@ from telegram.ext import (
 )
 
 from ..constants import Conversation, Role
-from ..keyboards.admin import admin_panel_kb, confirm_keyboard
+from ..keyboards.admin import admin_panel_kb, cancel_keyboard, confirm_keyboard
 from ..services.permissions import require_role
 from ..utils.errors import ValidationError
 from ..utils.validators import parse_int
 from ..logging_config import logger
+
+
+_CMS_DRAFT_KEYS = [
+    "cms_node_id",
+    "cms_parent_id",
+    "cms_key",
+    "cms_title",
+    "cms_content",
+    "cms_url",
+    "cms_order",
+    "cms_is_main",
+]
+
+
+def _clear_cms_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in _CMS_DRAFT_KEYS:
+        context.user_data.pop(key, None)
 
 
 def _event_list_keyboard(events, prefix: str):
@@ -69,6 +87,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_reg = total_confirm = 0
     for ev in events:
         regs = await event_service.list_registrations(ev.event_id)
+        regs = [r for r in regs if r.status not in ("cancelled", "canceled")]
         confirmed = len([r for r in regs if r.status == "confirmed"])
         total_reg += len(regs)
         total_confirm += confirmed
@@ -291,7 +310,7 @@ async def remind_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     event_id = query.data.replace("admin_remind_pick_", "")
     event_service = context.application.bot_data["event_service"]
     regs = await event_service.list_registrations(event_id)
-    target = [r for r in regs if r.status != "confirmed"]
+    target = [r for r in regs if r.status not in ("confirmed", "cancelled", "canceled")]
     sent = 0
     for reg in target:
         try:
@@ -375,6 +394,7 @@ async def broadcast_event_send(update: Update, context: ContextTypes.DEFAULT_TYP
     text = context.user_data.get("broadcast_text", "")
     event_id = context.user_data.get("broadcast_event_id")
     regs = await context.application.bot_data["event_service"].list_registrations(event_id)
+    regs = [r for r in regs if r.status not in ("cancelled", "canceled")]
     sent = 0
     for reg in regs:
         try:
@@ -387,108 +407,239 @@ async def broadcast_event_send(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-# CMS
+# Node CMS
 @require_role(Role.ADMIN)
-async def cms_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def node_cms_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    content_service = context.application.bot_data["content_service"]
-    sections = await content_service.list_sections()
-    rows = [[InlineKeyboardButton(s.title, callback_data=f"cms_view_{s.key}")] for s in sections]
-    rows.append([InlineKeyboardButton("➕ Добавить", callback_data="cms_add")])
+    if query:
+        await query.answer()
+    
+    node_service = context.application.bot_data["node_service"]
+    # Show root nodes (where parent_id is NULL)
+    nodes = await node_service.get_children(None)
+    
+    rows = [[InlineKeyboardButton(f"📁 {n.title}", callback_data=f"adm_node_view_{n.id}")] for n in nodes]
+    rows.append([InlineKeyboardButton("➕ Добавить корневой раздел", callback_data="adm_node_add_none")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")])
-    await query.edit_message_text("Контентные разделы:", reply_markup=InlineKeyboardMarkup(rows))
+    
+    text = "Управление контентом и меню.\nВыберите раздел для редактирования или добавьте новый."
+    if query:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 
 @require_role(Role.ADMIN)
-async def cms_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_node_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    key = query.data.replace("cms_view_", "")
-    content_service = context.application.bot_data["content_service"]
-    section = await content_service.get_section(key)
-    if not section:
-        await query.edit_message_text("Раздел не найден", reply_markup=admin_panel_kb())
-        return
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✏️ Редактировать", callback_data=f"cms_edit_{key}")],
-            [InlineKeyboardButton("🗑 Удалить", callback_data=f"cms_del_{key}")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
-        ]
+    node_id = int(query.data.replace("adm_node_view_", ""))
+    
+    node_service = context.application.bot_data["node_service"]
+    node = await node_service.get_node(node_id)
+    children = await node_service.get_children(node_id)
+    
+    # В админке показываем контент "как есть" без Markdown-рендеринга:
+    # иначе любой невалидный Markdown в node.content ломает edit_message_text,
+    # и визуально выглядит как "не работает кнопка назад".
+    parent_label = node.parent_id if node.parent_id is not None else "корень"
+    text = (
+        f"📍 Раздел: {node.title} (ID: {node.id})\n"
+        f"⬆️ Родитель: {parent_label}\n"
+        f"🔑 Ключ: {node.key or 'нет'}\n"
+        f"🔗 URL: {node.url or 'нет'}\n"
+        f"🔢 Порядок: {node.order_index}\n"
+        f"🏠 Главное меню: {'да' if node.is_main_menu else 'нет'}\n\n"
+        f"📝 Текст:\n{node.content}"
     )
-    await query.edit_message_text(f"{section.title}\n\n{section.body}", reply_markup=kb)
+    
+    rows = []
+    # Children
+    for child in children:
+        rows.append([InlineKeyboardButton(f"  └ {child.title}", callback_data=f"adm_node_view_{child.id}")])
+    
+    rows.append([InlineKeyboardButton("➕ Добавить подраздел", callback_data=f"adm_node_add_{node_id}")])
+    rows.append([
+        InlineKeyboardButton("✏️ Текст/Назв", callback_data=f"adm_node_edit_{node_id}"),
+        InlineKeyboardButton("🗑 Удалить", callback_data=f"adm_node_del_{node_id}")
+    ])
+    
+    if node.parent_id is not None:
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"adm_node_view_{node.parent_id}")])
+    else:
+        rows.append([InlineKeyboardButton("⬅️ В начало", callback_data="admin_cms")])
+        
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(rows),
+        disable_web_page_preview=True,
+    )
 
 
 @require_role(Role.ADMIN)
-async def cms_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_node_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Введите ключ раздела (латиница/цифры):")
-    return Conversation.EDIT_CONTENT_KEY
+    
+    # Clear previous CMS data
+    _clear_cms_draft(context)
+        
+    parent_id = query.data.replace("adm_node_add_", "")
+    context.user_data["cms_parent_id"] = int(parent_id) if parent_id != "none" else None
+    
+    await query.edit_message_text("Введите заголовок кнопки:", reply_markup=cancel_keyboard())
+    return Conversation.NODE_EDIT_TITLE
 
 
-async def cms_add_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["cms_key"] = update.message.text.strip()
-    await update.message.reply_text("Введите заголовок:")
-    return Conversation.EDIT_CONTENT_TITLE
-
-
-async def cms_add_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["cms_title"] = update.message.text.strip()
-    await update.message.reply_text("Введите текст:")
-    return Conversation.EDIT_CONTENT_BODY
-
-
-async def cms_add_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    content_service = context.application.bot_data["content_service"]
-    await content_service.save_section(
-        context.user_data["cms_key"], context.user_data["cms_title"], update.message.text
+@require_role(Role.ADMIN)
+async def adm_node_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    node_id = int(query.data.replace("adm_node_edit_", ""))
+    
+    node_service = context.application.bot_data["node_service"]
+    node = await node_service.get_node(node_id)
+    
+    context.user_data["cms_node_id"] = node_id
+    context.user_data["cms_parent_id"] = node.parent_id
+    context.user_data["cms_key"] = node.key
+    context.user_data["cms_title"] = node.title
+    context.user_data["cms_content"] = node.content
+    context.user_data["cms_url"] = node.url
+    context.user_data["cms_order"] = node.order_index
+    context.user_data["cms_is_main"] = node.is_main_menu
+    
+    await query.edit_message_text(
+        f"Текущий заголовок: {node.title}\nВведите новый или /skip:",
+        reply_markup=cancel_keyboard(),
     )
-    await update.message.reply_text("Сохранено", reply_markup=admin_panel_kb())
+    return Conversation.NODE_EDIT_TITLE
+
+
+async def adm_node_title_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text != "/skip":
+        context.user_data["cms_title"] = text
+    
+    await update.message.reply_text(
+        "Введите текст сообщения (поддерживается Markdown) или /skip:",
+        reply_markup=cancel_keyboard(),
+    )
+    return Conversation.NODE_EDIT_CONTENT
+
+
+async def adm_node_content_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text != "/skip":
+        context.user_data["cms_content"] = text
+    
+    await update.message.reply_text(
+        "Введите URL (если кнопка должна открывать ссылку) или /none или /skip:",
+        reply_markup=cancel_keyboard(),
+    )
+    return Conversation.NODE_EDIT_URL
+
+
+async def adm_node_url_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "/none":
+        context.user_data["cms_url"] = None
+    elif text != "/skip":
+        context.user_data["cms_url"] = text
+    
+    await update.message.reply_text(
+        "Введите порядок сортировки (число) или /skip:",
+        reply_markup=cancel_keyboard(),
+    )
+    return Conversation.NODE_EDIT_ORDER
+
+
+async def adm_node_order_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text != "/skip":
+        try:
+            context.user_data["cms_order"] = int(text)
+        except ValueError:
+            await update.message.reply_text("Введите число!")
+            return Conversation.NODE_EDIT_ORDER
+            
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да", callback_data="adm_node_is_main_yes"),
+         InlineKeyboardButton("❌ Нет", callback_data="adm_node_is_main_no")],
+        [InlineKeyboardButton("⏩ Пропустить", callback_data="adm_node_is_main_skip")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="adm_node_cancel")],
+    ])
+    await update.message.reply_text("Показывать в главном меню (Reply Keyboard)?", reply_markup=kb)
+    return Conversation.NODE_EDIT_IS_MAIN
+
+
+async def adm_node_is_main_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "adm_node_is_main_yes":
+        context.user_data["cms_is_main"] = True
+    elif query.data == "adm_node_is_main_no":
+        context.user_data["cms_is_main"] = False
+        
+    node_service = context.application.bot_data["node_service"]
+    await node_service.save_node(
+        node_id=context.user_data.get("cms_node_id"),
+        parent_id=context.user_data.get("cms_parent_id"),
+        key=context.user_data.get("cms_key"),
+        title=context.user_data.get("cms_title"),
+        content=context.user_data.get("cms_content", "Пусто"),
+        url=context.user_data.get("cms_url"),
+        order_index=context.user_data.get("cms_order", 0),
+        is_main_menu=context.user_data.get("cms_is_main", False)
+    )
+    
+    # Invalidate main menu cache
+    context.application.bot_data.pop("main_menu_cache", None)
+    
+    await query.edit_message_text("✅ Сохранено!")
+    # Clear user data
+    for key in ["cms_node_id", "cms_parent_id", "cms_title", "cms_content", "cms_url", "cms_order", "cms_is_main"]:
+        context.user_data.pop(key, None)
+        
+    await node_cms_start(update, context)
     return ConversationHandler.END
 
 
 @require_role(Role.ADMIN)
-async def cms_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_node_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    key = query.data.replace("cms_del_", "")
-    await context.application.bot_data["content_service"].delete_section(key)
-    await query.edit_message_text("Удалено", reply_markup=admin_panel_kb())
-
-
-# Menu management
-@require_role(Role.ADMIN)
-async def menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    content_service = context.application.bot_data["content_service"]
-    items = await content_service.list_menu_items()
-    rows = [[InlineKeyboardButton(i.title, callback_data=f"menu_edit_{i.key}")] for i in items]
-    rows.append([InlineKeyboardButton("➕ Добавить", callback_data="menu_add")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")])
-    await query.edit_message_text("Главное меню:", reply_markup=InlineKeyboardMarkup(rows))
+    node_id = int(query.data.replace("adm_node_del_", ""))
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"adm_node_del_confirm_{node_id}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"adm_node_view_{node_id}")]
+    ])
+    await query.edit_message_text("⚠️ Вы уверены? Это удалит также все подразделы!", reply_markup=kb)
 
 
 @require_role(Role.ADMIN)
-async def menu_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_node_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Введите ключ|текст|позиция (через |):")
-    return Conversation.EDIT_MENU_ITEM
-
-
-async def menu_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    content_service = context.application.bot_data["content_service"]
-    try:
-        key, title, pos = [x.strip() for x in update.message.text.split("|", 2)]
-        position = int(pos)
-        await content_service.save_menu_item(key, title, position)
-        await update.message.reply_text("Меню обновлено", reply_markup=admin_panel_kb())
-    except Exception:
-        await update.message.reply_text("Формат: key|Текст|позиция")
-        return Conversation.EDIT_MENU_ITEM
+    node_id = int(query.data.replace("adm_node_del_confirm_", ""))
+    
+    node_service = context.application.bot_data["node_service"]
+    node = await node_service.get_node(node_id)
+    parent_id = node.parent_id if node else None
+    
+    await node_service.delete_node(node_id)
+    # Invalidate main menu cache
+    context.application.bot_data.pop("main_menu_cache", None)
+    
+    await query.edit_message_text("🗑 Удалено")
+    
+    if parent_id is not None:
+        query.data = f"adm_node_view_{parent_id}"
+        await adm_node_view(update, context)
+    else:
+        await node_cms_start(update, context)
     return ConversationHandler.END
 
 
@@ -515,9 +666,12 @@ async def role_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["role_user_id"] = uid
     kb = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("admin", callback_data="role_set_admin")],
-            [InlineKeyboardButton("moderator", callback_data="role_set_moderator")],
-            [InlineKeyboardButton("user", callback_data="role_set_user")],
+            # ВАЖНО: не полагаемся на context.user_data, потому что при нескольких
+            # одновременно запущенных инстансах бота (409 Conflict) callback может
+            # обработать другой процесс и user_data будет пустой.
+            [InlineKeyboardButton("admin", callback_data=f"role_set_admin_{uid}")],
+            [InlineKeyboardButton("moderator", callback_data=f"role_set_moderator_{uid}")],
+            [InlineKeyboardButton("user", callback_data=f"role_set_user_{uid}")],
         ]
     )
     await query.edit_message_text("Выберите роль:", reply_markup=kb)
@@ -527,8 +681,23 @@ async def role_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def role_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    role_name = query.data.replace("role_set_", "")
-    uid = context.user_data.get("role_user_id")
+    payload = query.data.replace("role_set_", "")
+    # Поддерживаем оба формата:
+    # - новый: role_set_<role>_<user_id>
+    # - старый: role_set_<role> (user_id берём из user_data)
+    parts = payload.split("_", 1)
+    role_name = parts[0]
+    uid = None
+    if len(parts) == 2:
+        try:
+            uid = int(parts[1])
+        except ValueError:
+            uid = None
+    if uid is None:
+        uid = context.user_data.get("role_user_id")
+    if uid is None:
+        await query.edit_message_text("❌ Не удалось определить пользователя. Откройте назначение роли заново.", reply_markup=admin_panel_kb())
+        return
     profile_service = context.application.bot_data["profile_service"]
     await profile_service.assign_role(uid, Role(role_name))
     await query.edit_message_text("Роль обновлена", reply_markup=admin_panel_kb())
@@ -551,9 +720,66 @@ async def restart_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await restart_service.schedule_restart(update, context, code=0)
 
 
+async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отменено.", reply_markup=admin_panel_kb())
+    return ConversationHandler.END
+
+
+@require_role(Role.ADMIN)
+async def adm_node_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel Node CMS add/edit flow and return to CMS root."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    # Clear CMS draft data
+    _clear_cms_draft(context)
+
+    if query:
+        await query.edit_message_text("Отменено.")
+    else:
+        await update.message.reply_text("Отменено.")
+
+    await node_cms_start(update, context)
+    return ConversationHandler.END
+
+
+@require_role(Role.ADMIN)
+async def adm_node_view_from_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow navigation callbacks while a Node CMS conversation is active."""
+    _clear_cms_draft(context)
+    await adm_node_view(update, context)
+    return ConversationHandler.END
+
+
+@require_role(Role.ADMIN)
+async def node_cms_start_from_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow returning to CMS root while a Node CMS conversation is active."""
+    _clear_cms_draft(context)
+    await node_cms_start(update, context)
+    return ConversationHandler.END
+
+
+@require_role(Role.ADMIN)
+async def admin_panel_from_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allow returning to admin panel while a conversation is active."""
+    _clear_cms_draft(context)
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+
 def setup_handlers(application):
     conv = ConversationHandler(
-        entry_points=[],
+        entry_points=[
+            MessageHandler(filters.Command("admin"), admin_login),
+            CallbackQueryHandler(add_event_start, pattern="^admin_add_event$"),
+            CallbackQueryHandler(edit_event_field, pattern="^admin_edit_field_.*$"),
+            CallbackQueryHandler(broadcast_all_start, pattern="^admin_broadcast_all$"),
+            CallbackQueryHandler(broadcast_event_start, pattern="^admin_broadcast_event$"),
+            CallbackQueryHandler(broadcast_event_pick, pattern="^admin_broadcast_pick_.*$"),
+            CallbackQueryHandler(adm_node_add, pattern="^adm_node_add_.*$"),
+            CallbackQueryHandler(adm_node_edit, pattern="^adm_node_edit_.*$"),
+        ],
         states={
             Conversation.WAITING_ADMIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_login_check)],
             Conversation.WAITING_EVENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_name)],
@@ -565,39 +791,67 @@ def setup_handlers(application):
             Conversation.WAITING_BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_all_send, pattern="^admin_broadcast_send$")],
             Conversation.WAITING_EVENT_BROADCAST_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_event_text)],
             Conversation.WAITING_EVENT_BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_event_send, pattern="^admin_broadcast_event_send$")],
-            Conversation.EDIT_CONTENT_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, cms_add_key)],
-            Conversation.EDIT_CONTENT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, cms_add_title)],
-            Conversation.EDIT_CONTENT_BODY: [MessageHandler(filters.TEXT & ~filters.COMMAND, cms_add_body)],
-            Conversation.EDIT_MENU_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, menu_add_value)],
+            # Node CMS states
+            Conversation.NODE_EDIT_TITLE: [
+                CallbackQueryHandler(adm_node_cancel, pattern="^adm_node_cancel$"),
+                CallbackQueryHandler(adm_node_view_from_conv, pattern="^adm_node_view_.*$"),
+                CallbackQueryHandler(node_cms_start_from_conv, pattern="^admin_cms$"),
+                CallbackQueryHandler(admin_panel_from_conv, pattern="^admin_panel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/skip$"), adm_node_title_input),
+            ],
+            Conversation.NODE_EDIT_CONTENT: [
+                CallbackQueryHandler(adm_node_cancel, pattern="^adm_node_cancel$"),
+                CallbackQueryHandler(adm_node_view_from_conv, pattern="^adm_node_view_.*$"),
+                CallbackQueryHandler(node_cms_start_from_conv, pattern="^admin_cms$"),
+                CallbackQueryHandler(admin_panel_from_conv, pattern="^admin_panel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/skip$"), adm_node_content_input),
+            ],
+            Conversation.NODE_EDIT_URL: [
+                CallbackQueryHandler(adm_node_cancel, pattern="^adm_node_cancel$"),
+                CallbackQueryHandler(adm_node_view_from_conv, pattern="^adm_node_view_.*$"),
+                CallbackQueryHandler(node_cms_start_from_conv, pattern="^admin_cms$"),
+                CallbackQueryHandler(admin_panel_from_conv, pattern="^admin_panel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|none)$"), adm_node_url_input),
+            ],
+            Conversation.NODE_EDIT_ORDER: [
+                CallbackQueryHandler(adm_node_cancel, pattern="^adm_node_cancel$"),
+                CallbackQueryHandler(adm_node_view_from_conv, pattern="^adm_node_view_.*$"),
+                CallbackQueryHandler(node_cms_start_from_conv, pattern="^admin_cms$"),
+                CallbackQueryHandler(admin_panel_from_conv, pattern="^admin_panel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/skip$"), adm_node_order_input),
+            ],
+            Conversation.NODE_EDIT_IS_MAIN: [
+                CallbackQueryHandler(adm_node_cancel, pattern="^adm_node_cancel$"),
+                CallbackQueryHandler(adm_node_view_from_conv, pattern="^adm_node_view_.*$"),
+                CallbackQueryHandler(node_cms_start_from_conv, pattern="^admin_cms$"),
+                CallbackQueryHandler(admin_panel_from_conv, pattern="^admin_panel$"),
+                CallbackQueryHandler(adm_node_is_main_input, pattern="^adm_node_is_main_.*$"),
+            ],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("cancel", admin_cancel), CallbackQueryHandler(adm_node_cancel, pattern="^adm_node_cancel$")],
         per_user=True,
     )
     application.add_handler(conv)
-    application.add_handler(MessageHandler(filters.Command("admin"), admin_login))
     application.add_handler(MessageHandler(filters.Regex("^⚙️ Админка$"), admin_entry))
     application.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
     application.add_handler(CallbackQueryHandler(stats, pattern="^admin_stats$"))
     application.add_handler(CallbackQueryHandler(export_regs, pattern="^admin_export_regs$"))
     application.add_handler(CallbackQueryHandler(export_users, pattern="^admin_export_users$"))
-    application.add_handler(CallbackQueryHandler(add_event_start, pattern="^admin_add_event$"))
     application.add_handler(CallbackQueryHandler(edit_event_start, pattern="^admin_edit_event$"))
     application.add_handler(CallbackQueryHandler(edit_event_pick, pattern="^admin_edit_pick_.*$"))
-    application.add_handler(CallbackQueryHandler(edit_event_field, pattern="^admin_edit_field_.*$"))
     application.add_handler(CallbackQueryHandler(delete_event_start, pattern="^admin_delete_event$"))
     application.add_handler(CallbackQueryHandler(delete_event_confirm, pattern="^admin_delete_pick_.*$"))
     application.add_handler(CallbackQueryHandler(delete_event_go, pattern="^admin_delete_go_.*$"))
     application.add_handler(CallbackQueryHandler(remind_unconfirmed, pattern="^admin_remind$"))
     application.add_handler(CallbackQueryHandler(remind_send, pattern="^admin_remind_pick_.*$"))
-    application.add_handler(CallbackQueryHandler(broadcast_all_start, pattern="^admin_broadcast_all$"))
-    application.add_handler(CallbackQueryHandler(broadcast_event_start, pattern="^admin_broadcast_event$"))
-    application.add_handler(CallbackQueryHandler(broadcast_event_pick, pattern="^admin_broadcast_pick_.*$"))
-    application.add_handler(CallbackQueryHandler(cms_start, pattern="^admin_cms$"))
-    application.add_handler(CallbackQueryHandler(cms_view, pattern="^cms_view_.*$"))
-    application.add_handler(CallbackQueryHandler(cms_add, pattern="^cms_add$"))
-    application.add_handler(CallbackQueryHandler(cms_delete, pattern="^cms_del_.*$"))
-    application.add_handler(CallbackQueryHandler(menu_start, pattern="^admin_menu$"))
-    application.add_handler(CallbackQueryHandler(menu_add, pattern="^menu_add$"))
+    
+    # Node CMS
+    application.add_handler(CallbackQueryHandler(node_cms_start, pattern="^admin_cms$"))
+    application.add_handler(CallbackQueryHandler(node_cms_start, pattern="^admin_menu$"))
+    application.add_handler(CallbackQueryHandler(adm_node_view, pattern="^adm_node_view_.*$"))
+    application.add_handler(CallbackQueryHandler(adm_node_delete, pattern=r"^adm_node_del_(\d+)$"))
+    application.add_handler(CallbackQueryHandler(adm_node_delete_confirm, pattern="^adm_node_del_confirm_.*$"))
+    
     application.add_handler(CallbackQueryHandler(roles_start, pattern="^admin_roles$"))
     application.add_handler(CallbackQueryHandler(role_pick, pattern="^role_pick_.*$"))
     application.add_handler(CallbackQueryHandler(role_set, pattern="^role_set_.*$"))

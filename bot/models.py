@@ -60,3 +60,15 @@ class Template:
     key: str
     body: str
 
+
+@dataclass
+class Node:
+    id: Optional[int]
+    parent_id: Optional[int]
+    key: Optional[str]
+    title: str
+    content: str
+    url: Optional[str] = None
+    order_index: int = 0
+    is_main_menu: bool = False
+

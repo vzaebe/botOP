@@ -16,6 +16,8 @@ class Database:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             self._conn = await aiosqlite.connect(self.path)
             await self._conn.execute("PRAGMA foreign_keys = ON;")
+            await self._conn.execute("PRAGMA journal_mode = WAL;")
+            await self._conn.execute("PRAGMA synchronous = NORMAL;")
         return self._conn
 
     async def execute(self, query: str, params: Iterable[Any] | Dict[str, Any] = ()):
@@ -110,6 +112,21 @@ class Database:
             CREATE TABLE IF NOT EXISTS templates (
                 key TEXT PRIMARY KEY,
                 body TEXT NOT NULL
+            );
+        """
+        )
+        await self.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id INTEGER,
+                key TEXT UNIQUE,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                url TEXT,
+                order_index INTEGER DEFAULT 0,
+                is_main_menu INTEGER DEFAULT 0,
+                FOREIGN KEY(parent_id) REFERENCES nodes(id) ON DELETE CASCADE
             );
         """
         )

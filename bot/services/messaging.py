@@ -16,12 +16,23 @@ def build_main_keyboard(menu_items: List[tuple[str, str]], show_admin: bool) -> 
 
 
 async def send_main_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str = "Главное меню"):
-    content_service = context.application.bot_data["content_service"]
+    node_service = context.application.bot_data["node_service"]
     role_service = context.application.bot_data["role_service"]
-    menu_items = await content_service.list_menu_items()
+
+    # Базовый пользовательский функционал (стабильные кнопки)
+    base_items: List[tuple[str, str]] = [
+        ("events", "📋 Мероприятия"),
+        ("my_regs", "🗓 Мои регистрации"),
+        ("profile", "👤 Профиль"),
+    ]
+
+    # Доп. контентные разделы (nodes) можно добавлять админом
+    menu_nodes = await node_service.get_main_menu_nodes()
+    node_items = [(n.key or str(n.id), n.title) for n in menu_nodes]
+
     role = await role_service.get_role(chat_id)
     keyboard = build_main_keyboard(
-        menu_items=[(m.key, m.title) for m in menu_items],
+        menu_items=base_items + node_items,
         show_admin=role in (Role.ADMIN, Role.MODERATOR),
     )
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)

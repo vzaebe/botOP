@@ -85,7 +85,10 @@ async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def setup_handlers(application):
     conv = ConversationHandler(
-        entry_points=[],
+        entry_points=[
+            CallbackQueryHandler(ask_name, pattern="^profile_edit_name$"),
+            CallbackQueryHandler(ask_email, pattern="^profile_edit_email$"),
+        ],
         states={
             Conversation.INPUT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_name)],
             Conversation.INPUT_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_email)],
@@ -94,8 +97,6 @@ def setup_handlers(application):
         per_user=True,
     )
     application.add_handler(conv)
-    application.add_handler(CallbackQueryHandler(ask_name, pattern="^profile_edit_name$"))
-    application.add_handler(CallbackQueryHandler(ask_email, pattern="^profile_edit_email$"))
     application.add_handler(CallbackQueryHandler(back, pattern="^profile_back$"))
     application.add_handler(MessageHandler(filters.Regex("^👤 Профиль$"), show_profile))
 

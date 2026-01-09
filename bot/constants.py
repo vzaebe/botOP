@@ -30,4 +30,10 @@ class Conversation(IntEnum):
     EDIT_EVENT_VALUE = 20
     ROLE_ASSIGN_USER = 21
     ROLE_ASSIGN_VALUE = 22
+    # Node CMS
+    NODE_EDIT_TITLE = 23
+    NODE_EDIT_CONTENT = 24
+    NODE_EDIT_URL = 25
+    NODE_EDIT_ORDER = 26
+    NODE_EDIT_IS_MAIN = 27
 

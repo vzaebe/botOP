@@ -30,6 +30,31 @@ async def list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Доступные мероприятия:", reply_markup=_event_keyboard(events))
 
 
+async def list_my_registrations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    profile_service = context.application.bot_data["profile_service"]
+    event_service = context.application.bot_data["event_service"]
+
+    profile = await profile_service.get_profile(update.effective_user.id)
+    if not profile or not profile.consent:
+        await update.message.reply_text("Необходимо согласие на обработку ПДн. Нажмите /start.")
+        return
+
+    regs = await event_service.list_user_registrations(update.effective_user.id, only_active=True)
+    if not regs:
+        await update.message.reply_text("У вас нет активных регистраций.")
+        return
+
+    rows = []
+    for reg in regs:
+        ev = await event_service.get_event(reg.event_id)
+        if not ev:
+            continue
+        status = "✅" if reg.status == "confirmed" else "🕓"
+        rows.append([InlineKeyboardButton(f"{status} {ev.name} ({ev.datetime_str})", callback_data=f"event_view_{ev.event_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="events_back")])
+    await update.message.reply_text("Ваши регистрации:", reply_markup=InlineKeyboardMarkup(rows))
+
+
 async def view_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -40,17 +65,27 @@ async def view_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Мероприятие не найдено.")
         return
     regs = await event_service.list_registrations(event_id)
-    free = event.max_seats - len(regs)
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📝 Зарегистрироваться", callback_data=f"event_register_{event_id}")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="events_back")],
-        ]
-    )
+    active_regs = [r for r in regs if r.status not in ("cancelled", "canceled")]
+    free = event.max_seats - len(active_regs)
+
+    user_reg = await event_service.get_user_registration(query.from_user.id, event_id)
+    user_status = "—"
+    actions = []
+    if not user_reg or user_reg.status in ("cancelled", "canceled"):
+        actions.append([InlineKeyboardButton("📝 Зарегистрироваться", callback_data=f"event_register_{event_id}")])
+    else:
+        user_status = user_reg.status
+        if user_reg.status != "confirmed":
+            actions.append([InlineKeyboardButton("✅ Подтвердить участие", callback_data=f"event_confirm_{event_id}")])
+        actions.append([InlineKeyboardButton("❌ Отменить регистрацию", callback_data=f"event_cancel_{event_id}")])
+
+    actions.append([InlineKeyboardButton("⬅️ Назад", callback_data="events_back")])
+    kb = InlineKeyboardMarkup(actions)
     text = (
         f"📌 {event.name}\n"
         f"📅 {event.datetime_str}\n"
         f"📝 {event.description}\n"
+        f"Ваш статус: {user_status}\n"
         f"Свободно мест: {free}/{event.max_seats}"
     )
     await query.edit_message_text(text, reply_markup=kb)
@@ -153,12 +188,28 @@ async def confirm_registration_callback(update: Update, context: ContextTypes.DE
     event_id = query.data.replace("event_confirm_", "")
     event_service = context.application.bot_data["event_service"]
     try:
-        await event_service.register_user(query.from_user.id, event_id)
+        await event_service.confirm_or_register(query.from_user.id, event_id)
     except ValidationError as exc:
         await query.edit_message_text(f"❌ {exc}")
         return ConversationHandler.END
     event = await event_service.get_event(event_id)
-    await query.edit_message_text(f"🎉 Вы зарегистрированы на {event.name}")
+    await query.edit_message_text(f"✅ Участие подтверждено: {event.name}")
+    await send_main_menu(context, query.from_user.id)
+    return ConversationHandler.END
+
+
+async def cancel_registration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    event_id = query.data.replace("event_cancel_", "")
+    event_service = context.application.bot_data["event_service"]
+    try:
+        await event_service.cancel_registration(query.from_user.id, event_id)
+    except ValidationError as exc:
+        await query.edit_message_text(f"❌ {exc}")
+        return ConversationHandler.END
+    event = await event_service.get_event(event_id)
+    await query.edit_message_text(f"🗑 Регистрация отменена: {event.name if event else event_id}")
     await send_main_menu(context, query.from_user.id)
     return ConversationHandler.END
 
@@ -172,7 +223,9 @@ async def back_from_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def setup_handlers(application):
     conv = ConversationHandler(
-        entry_points=[],
+        entry_points=[
+            CallbackQueryHandler(start_registration, pattern="^event_register_.*$"),
+        ],
         states={
             Conversation.INPUT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_name)],
             Conversation.INPUT_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_email)],
@@ -181,9 +234,11 @@ def setup_handlers(application):
         per_user=True,
     )
     application.add_handler(conv)
+    # Основные пункты меню обрабатываются роутером, но оставляем хендлеры совместимости.
     application.add_handler(MessageHandler(filters.Regex("^📋 Мероприятия$"), list_events))
+    application.add_handler(MessageHandler(filters.Regex("^🗓 Мои регистрации$"), list_my_registrations))
     application.add_handler(CallbackQueryHandler(view_event, pattern="^event_view_.*$"))
-    application.add_handler(CallbackQueryHandler(start_registration, pattern="^event_register_.*$"))
     application.add_handler(CallbackQueryHandler(confirm_registration_callback, pattern="^event_confirm_.*$"))
+    application.add_handler(CallbackQueryHandler(cancel_registration_callback, pattern="^event_cancel_.*$"))
     application.add_handler(CallbackQueryHandler(back_from_events, pattern="^events_back$"))
 
