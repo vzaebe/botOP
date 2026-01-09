@@ -38,6 +38,8 @@ async def on_startup(app: Application):
     # grant admin roles from config
     profile_service = app.bot_data["profile_service"]
     for admin_id in config.admin_ids:
+        # гарантируем запись пользователя, иначе FK на roles упадёт
+        await profile_service.ensure_user(admin_id, username="", full_name=f"admin-{admin_id}")
         await profile_service.assign_role(admin_id, Role.ADMIN)
 
 
