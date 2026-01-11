@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import field
+from datetime import datetime, timezone
 from typing import Optional
 
 from .constants import Role
 
 
 def utcnow_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    # Store timestamps as UTC for consistency across servers/timezones.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 @dataclass
@@ -19,8 +21,8 @@ class User:
     email: str = ""
     consent: bool = False
     consent_time: Optional[str] = None
-    created_at: str = utcnow_str()
-    updated_at: str = utcnow_str()
+    created_at: str = field(default_factory=utcnow_str)
+    updated_at: str = field(default_factory=utcnow_str)
 
 
 @dataclass
@@ -38,7 +40,7 @@ class Registration:
     user_id: int
     event_id: str
     status: str = "registered"
-    reg_time: str = utcnow_str()
+    reg_time: str = field(default_factory=utcnow_str)
 
 
 @dataclass

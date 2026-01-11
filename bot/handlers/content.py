@@ -120,6 +120,3 @@ def setup_handlers(application):
 
     # Node navigation
     application.add_handler(CallbackQueryHandler(node_view, pattern=r"^node_\d+$"))
-
-    # Main menu buttons (Reply Keyboard) - Catch node titles
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_handler))

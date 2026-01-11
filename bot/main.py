@@ -26,9 +26,12 @@ from .handlers import menu as menu_handlers
 from .services.messaging import send_main_menu
 from .utils.errors import PermissionDenied
 import logging
+import time
 
 
 async def on_startup(app: Application):
+    # for uptime/diagnostics
+    app.bot_data.setdefault("started_at", time.time())
     config = app.bot_data["config"]
     db: Database = app.bot_data["db"]
     await db.init_db()
@@ -39,13 +42,18 @@ async def on_startup(app: Application):
     await content_service.ensure_defaults()
     node_service: NodeService = app.bot_data["node_service"]
     await node_service.ensure_defaults()
-    app.bot_data["restart_service"] = RestartService(enabled=True)
     # grant admin roles from config
     profile_service = app.bot_data["profile_service"]
     for admin_id in config.admin_ids:
         # гарантируем запись пользователя, иначе FK на roles упадёт
         await profile_service.ensure_user(admin_id, username="", full_name=f"admin-{admin_id}")
         await profile_service.assign_role(admin_id, Role.ADMIN)
+
+
+async def on_shutdown(app: Application):
+    db: Database = app.bot_data.get("db")
+    if db:
+        await db.close()
 
 
 async def on_error(update, context):
@@ -60,7 +68,13 @@ async def on_error(update, context):
 
 def build_application() -> Application:
     config = load_config()
-    logger = setup_logging(config.log_level)
+    logger = setup_logging(
+        config.log_level,
+        log_file=config.log_file,
+        max_bytes=config.log_max_bytes,
+        backup_count=config.log_backup_count,
+    )
+    started_at = time.time()
     db = Database(config.database_path)
     user_repo = UserRepository(db)
     role_repo = RoleRepository(db)
@@ -79,6 +93,7 @@ def build_application() -> Application:
         ApplicationBuilder()
         .token(config.bot_token)
         .post_init(on_startup)
+        .post_shutdown(on_shutdown)
         .build()
     )
 
@@ -90,7 +105,8 @@ def build_application() -> Application:
     app.bot_data["node_service"] = node_service
     app.bot_data["migrator"] = migrator
     app.bot_data["role_service"] = profile_service  # reuse profile service for role ops
-    app.bot_data["restart_service"] = RestartService(enabled=True)
+    app.bot_data["restart_service"] = RestartService(enabled=config.restart_enabled)
+    app.bot_data["started_at"] = started_at
 
     start_handlers.setup_handlers(app)
     profile_handlers.setup_handlers(app)
@@ -99,7 +115,13 @@ def build_application() -> Application:
     content_handlers.setup_handlers(app)
     menu_handlers.setup_handlers(app)
     app.add_error_handler(on_error)
-    logger.info("Bot initialized")
+    logger.info(
+        "Bot initialized (log_level=%s, db=%s, admins=%s, restart=%s)",
+        config.log_level,
+        config.database_path,
+        len(config.admin_ids),
+        config.restart_enabled,
+    )
     return app
 
 

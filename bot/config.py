@@ -15,6 +15,9 @@ class Config:
     database_path: str
     personal_data_link: str
     log_level: str = "INFO"
+    log_file: str = os.path.join("data", "bot.log")
+    log_max_bytes: int = 5 * 1024 * 1024
+    log_backup_count: int = 3
     restart_enabled: bool = True
 
 
@@ -31,6 +34,26 @@ def _parse_admin_ids(raw: str) -> List[int]:
     return ids
 
 
+def _parse_bool(raw: str, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _parse_int(raw: str | None, default: int) -> int:
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except Exception:
+        return default
+
+
 def load_config() -> Config:
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
@@ -45,6 +68,10 @@ def load_config() -> Config:
     personal_link = os.getenv("PERSONAL_DATA_LINK", "<ВСТАВЬТЕ_ССЫЛКУ_ТУТ>")
     db_path = os.getenv("DATABASE_PATH", os.path.join("data", "bot.db"))
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_file = os.getenv("LOG_FILE", os.path.join("data", "bot.log"))
+    log_max_bytes = _parse_int(os.getenv("LOG_MAX_BYTES"), 5 * 1024 * 1024)
+    log_backup_count = _parse_int(os.getenv("LOG_BACKUP_COUNT"), 3)
+    restart_enabled = _parse_bool(os.getenv("RESTART_ENABLED", "true"), default=True)
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
@@ -55,5 +82,9 @@ def load_config() -> Config:
         database_path=db_path,
         personal_data_link=personal_link,
         log_level=log_level,
+        log_file=log_file,
+        log_max_bytes=log_max_bytes,
+        log_backup_count=log_backup_count,
+        restart_enabled=restart_enabled,
     )
 

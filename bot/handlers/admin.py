@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import io
 from datetime import datetime
+import sys
+import time
 from typing import Optional
 
-import pandas as pd
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ContextTypes,
@@ -22,6 +23,12 @@ from ..services.permissions import require_role
 from ..utils.errors import ValidationError
 from ..utils.validators import parse_int
 from ..logging_config import logger
+from ..utils.admin_diagnostics import (
+    format_seconds,
+    read_last_lines,
+    try_read_proc_loadavg,
+    try_read_proc_meminfo,
+)
 
 
 _CMS_DRAFT_KEYS = [
@@ -78,6 +85,105 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_role(Role.MODERATOR)
+async def admin_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = context.application.bot_data["config"]
+    started_at = context.application.bot_data.get("started_at")
+    uptime = format_seconds(time.time() - started_at) if started_at else "unknown"
+
+    db = context.application.bot_data.get("db")
+    users = events = regs = "n/a"
+    if db:
+        try:
+            row = await db.fetchone("SELECT COUNT(*) AS c FROM users")
+            users = str(int(row["c"])) if row else "0"
+            row = await db.fetchone("SELECT COUNT(*) AS c FROM events")
+            events = str(int(row["c"])) if row else "0"
+            row = await db.fetchone("SELECT COUNT(*) AS c FROM registrations")
+            regs = str(int(row["c"])) if row else "0"
+        except Exception:
+            users = events = regs = "err"
+
+    loadavg = try_read_proc_loadavg()
+    meminfo = try_read_proc_meminfo()
+
+    lines = [
+        "✅ admin_status",
+        f"uptime: {uptime}",
+        f"python: {sys.version.split()[0]}",
+        f"db: {cfg.database_path}",
+        f"log_level: {cfg.log_level}",
+        f"log_file: {getattr(cfg, 'log_file', '')}",
+        f"restart_enabled: {cfg.restart_enabled}",
+        f"counts: users={users}, events={events}, registrations={regs}",
+    ]
+    if loadavg:
+        lines.append(f"loadavg: {loadavg}")
+    if meminfo:
+        lines.append("meminfo:")
+        lines.append(meminfo)
+
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+@require_role(Role.MODERATOR)
+async def admin_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.application.bot_data.get("db")
+    if not db:
+        await update.effective_message.reply_text("❌ DB: not configured")
+        return
+
+    checks: list[str] = []
+    try:
+        await db.fetchone("SELECT 1 AS ok")
+        checks.append("✅ db: query_ok")
+    except Exception as exc:
+        checks.append(f"❌ db: query_failed ({exc.__class__.__name__})")
+
+    try:
+        row = await db.fetchone("PRAGMA foreign_keys;")
+        fk = row[0] if row else None
+        checks.append(f"✅ sqlite: foreign_keys={fk}")
+    except Exception as exc:
+        checks.append(f"⚠️ sqlite: foreign_keys check failed ({exc.__class__.__name__})")
+
+    try:
+        rows = await db.fetchall(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        have = {r["name"] for r in rows}
+        expected = {"users", "roles", "events", "registrations", "content_sections", "menu_items", "templates", "nodes"}
+        missing = sorted(expected - have)
+        if missing:
+            checks.append(f"❌ schema: missing tables: {', '.join(missing)}")
+        else:
+            checks.append("✅ schema: tables_ok")
+    except Exception as exc:
+        checks.append(f"❌ schema: check_failed ({exc.__class__.__name__})")
+
+    await update.effective_message.reply_text("\n".join(["✅ admin_health"] + checks))
+
+
+@require_role(Role.MODERATOR)
+async def admin_logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = context.application.bot_data["config"]
+    path = getattr(cfg, "log_file", "")
+    if not path:
+        await update.effective_message.reply_text("❌ LOG_FILE is not set")
+        return
+
+    text = read_last_lines(path, max_lines=120, max_bytes=64 * 1024)
+    if not text:
+        await update.effective_message.reply_text("Лог пустой или файл не найден.")
+        return
+
+    # Telegram message limit is ~4096 chars; keep headroom.
+    if len(text) > 3500:
+        text = text[-3500:]
+        text = "(truncated)\n" + text
+    await update.effective_message.reply_text(text)
+
+
+@require_role(Role.MODERATOR)
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -99,16 +205,22 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_role(Role.MODERATOR)
 async def export_regs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Heavy dependency: import lazily to keep bot startup fast on weak VPS.
+    import pandas as pd
+
     query = update.callback_query
     await query.answer()
-    user_repo = context.application.bot_data["profile_service"].user_repo
+    profile_service = context.application.bot_data["profile_service"]
+    user_repo = profile_service.user_repo
     event_service = context.application.bot_data["event_service"]
+    users = await profile_service.list_users()
+    user_by_id = {u.user_id: u for u in users}
     data = []
     events = await event_service.event_repo.list_events()
     for ev in events:
         regs = await event_service.list_registrations(ev.event_id)
         for reg in regs:
-            user = await user_repo.get_user(reg.user_id)
+            user = user_by_id.get(reg.user_id) or await user_repo.get_user(reg.user_id)
             data.append(
                 {
                     "event_id": ev.event_id,
@@ -136,6 +248,9 @@ async def export_regs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_role(Role.MODERATOR)
 async def export_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Heavy dependency: import lazily to keep bot startup fast on weak VPS.
+    import pandas as pd
+
     query = update.callback_query
     await query.answer()
     profile_service = context.application.bot_data["profile_service"]
@@ -181,7 +296,22 @@ async def add_event_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_event_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_event_dt"] = update.message.text.strip()
+    raw = update.message.text.strip()
+    # Be tolerant to a common typo: YYYY-MM.DD HH:MM (dot between month and day)
+    candidate = raw
+    if len(raw) >= 16 and raw[7:8] == "." and raw[:7].count("-") == 1:
+        # Example: 2026-02.12 12:00 -> 2026-02-12 12:00
+        candidate = raw[:7] + "-" + raw[8:]
+    try:
+        datetime.strptime(candidate, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Дата должна быть в формате YYYY-MM-DD HH:MM\n"
+            "Например: 2026-02-12 12:00"
+        )
+        return Conversation.WAITING_EVENT_DATETIME
+
+    context.user_data["new_event_dt"] = candidate
     await update.message.reply_text("Введите описание:")
     return Conversation.WAITING_EVENT_DESC
 
@@ -206,7 +336,15 @@ async def add_event_seats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             seats,
         )
     except ValidationError as exc:
-        await update.message.reply_text(f"❌ {exc}")
+        # If something went wrong (e.g. date format), guide user back to the right step.
+        msg = str(exc)
+        await update.message.reply_text(f"❌ {msg}")
+        if "Дата должна быть" in msg:
+            await update.message.reply_text("Введите дату и время (YYYY-MM-DD HH:MM):")
+            return Conversation.WAITING_EVENT_DATETIME
+        if "Количество мест" in msg:
+            await update.message.reply_text("Введите число мест:")
+            return Conversation.WAITING_EVENT_SEATS
         return Conversation.WAITING_EVENT_NAME
     await update.message.reply_text(f"✅ Добавлено: {ev.name}")
     await update.message.reply_text("Админ-панель", reply_markup=admin_panel_kb())
@@ -409,19 +547,15 @@ async def broadcast_event_send(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # Node CMS
 @require_role(Role.ADMIN)
-async def node_cms_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query:
-        await query.answer()
-    
+async def _node_cms_render(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
     node_service = context.application.bot_data["node_service"]
     # Show root nodes (where parent_id is NULL)
     nodes = await node_service.get_children(None)
-    
+
     rows = [[InlineKeyboardButton(f"📁 {n.title}", callback_data=f"adm_node_view_{n.id}")] for n in nodes]
     rows.append([InlineKeyboardButton("➕ Добавить корневой раздел", callback_data="adm_node_add_none")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")])
-    
+
     text = "Управление контентом и меню.\nВыберите раздел для редактирования или добавьте новый."
     if query:
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
@@ -430,15 +564,19 @@ async def node_cms_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_role(Role.ADMIN)
-async def adm_node_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def node_cms_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    node_id = int(query.data.replace("adm_node_view_", ""))
-    
+    if query:
+        await query.answer()
+    await _node_cms_render(update, context, query)
+
+
+@require_role(Role.ADMIN)
+async def _adm_node_view_render(query, context: ContextTypes.DEFAULT_TYPE, node_id: int):
     node_service = context.application.bot_data["node_service"]
     node = await node_service.get_node(node_id)
     children = await node_service.get_children(node_id)
-    
+
     # В админке показываем контент "как есть" без Markdown-рендеринга:
     # иначе любой невалидный Markdown в node.content ломает edit_message_text,
     # и визуально выглядит как "не работает кнопка назад".
@@ -452,28 +590,36 @@ async def adm_node_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏠 Главное меню: {'да' if node.is_main_menu else 'нет'}\n\n"
         f"📝 Текст:\n{node.content}"
     )
-    
+
     rows = []
     # Children
     for child in children:
         rows.append([InlineKeyboardButton(f"  └ {child.title}", callback_data=f"adm_node_view_{child.id}")])
-    
+
     rows.append([InlineKeyboardButton("➕ Добавить подраздел", callback_data=f"adm_node_add_{node_id}")])
     rows.append([
         InlineKeyboardButton("✏️ Текст/Назв", callback_data=f"adm_node_edit_{node_id}"),
         InlineKeyboardButton("🗑 Удалить", callback_data=f"adm_node_del_{node_id}")
     ])
-    
+
     if node.parent_id is not None:
         rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"adm_node_view_{node.parent_id}")])
     else:
         rows.append([InlineKeyboardButton("⬅️ В начало", callback_data="admin_cms")])
-        
+
     await query.edit_message_text(
         text,
         reply_markup=InlineKeyboardMarkup(rows),
         disable_web_page_preview=True,
     )
+
+
+@require_role(Role.ADMIN)
+async def adm_node_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    node_id = int(query.data.replace("adm_node_view_", ""))
+    await _adm_node_view_render(query, context, node_id)
 
 
 @require_role(Role.ADMIN)
@@ -636,10 +782,9 @@ async def adm_node_delete_confirm(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text("🗑 Удалено")
     
     if parent_id is not None:
-        query.data = f"adm_node_view_{parent_id}"
-        await adm_node_view(update, context)
+        await _adm_node_view_render(query, context, parent_id)
     else:
-        await node_cms_start(update, context)
+        await _node_cms_render(update, context, query)
     return ConversationHandler.END
 
 
@@ -833,6 +978,9 @@ def setup_handlers(application):
     )
     application.add_handler(conv)
     application.add_handler(MessageHandler(filters.Regex("^⚙️ Админка$"), admin_entry))
+    application.add_handler(CommandHandler("admin_status", admin_status_cmd))
+    application.add_handler(CommandHandler("admin_health", admin_health_cmd))
+    application.add_handler(CommandHandler("admin_logs", admin_logs_cmd))
     application.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
     application.add_handler(CallbackQueryHandler(stats, pattern="^admin_stats$"))
     application.add_handler(CallbackQueryHandler(export_regs, pattern="^admin_export_regs$"))

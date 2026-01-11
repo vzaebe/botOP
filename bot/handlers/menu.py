@@ -23,8 +23,13 @@ async def main_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Если это node-раздел из главного меню
     node_service = context.application.bot_data.get("node_service")
     if node_service:
-        nodes = await node_service.get_main_menu_nodes()
-        node = next((n for n in nodes if n.title == text), None)
+        # Use cache to avoid DB query on every message.
+        cache = context.application.bot_data.get("main_menu_cache")
+        if cache is None:
+            nodes = await node_service.get_main_menu_nodes()
+            cache = {n.title: n for n in nodes}
+            context.application.bot_data["main_menu_cache"] = cache
+        node = cache.get(text)
         if node:
             return await content_handlers.show_node(update, context, node, is_callback=False)
 

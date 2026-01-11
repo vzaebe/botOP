@@ -4,8 +4,6 @@ import json
 import os
 from datetime import datetime
 
-import pandas as pd
-
 from ..models import ContentSection, MenuItem, Template, Event, Registration, User
 from ..logging_config import logger
 from ..constants import Role
@@ -19,14 +17,26 @@ class MigrationService:
         self.reg_repo = reg_repo
         self.content_repo = content_repo
 
+    def _migration_marker_path(self) -> str:
+        # If legacy files are left in the folder, repeated Excel/JSON reads can slow down every restart.
+        # User can delete this marker to force re-run migration.
+        return os.path.join("data", ".legacy_migration_done")
+
     async def migrate_from_files(
         self,
         events_file: str = "events.xlsx",
         registrations_file: str = "registrations.xlsx",
         users_file: str = "bot_users.json",
     ):
+        marker = self._migration_marker_path()
+        if os.path.exists(marker):
+            return
+
         if not (os.path.exists(events_file) or os.path.exists(registrations_file) or os.path.exists(users_file)):
             return
+
+        # Heavy dependency: import lazily to keep bot startup fast on weak VPS.
+        import pandas as pd
 
         logger and logger.info("Starting migration from legacy files...")
 
@@ -89,6 +99,14 @@ class MigrationService:
 
         await self.ensure_defaults()
         logger and logger.info("Migration done.")
+
+        # Mark successful migration to avoid re-reading heavy legacy files on every restart.
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception as exc:
+            logger and logger.warning("Failed to write migration marker %s: %s", marker, exc)
 
     async def ensure_defaults(self):
         # fallback content

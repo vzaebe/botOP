@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from typing import Optional, Iterable, Any, Dict, List
 
 import aiosqlite
@@ -14,10 +15,13 @@ class Database:
     async def connect(self) -> aiosqlite.Connection:
         if self._conn is None:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            self._conn = await aiosqlite.connect(self.path)
+            # Small timeout helps avoid long stalls on slow disks.
+            self._conn = await aiosqlite.connect(self.path, timeout=5)
+            self._conn.row_factory = aiosqlite.Row
             await self._conn.execute("PRAGMA foreign_keys = ON;")
             await self._conn.execute("PRAGMA journal_mode = WAL;")
             await self._conn.execute("PRAGMA synchronous = NORMAL;")
+            await self._conn.execute("PRAGMA busy_timeout = 5000;")
         return self._conn
 
     async def execute(self, query: str, params: Iterable[Any] | Dict[str, Any] = ()):
@@ -29,7 +33,6 @@ class Database:
         self, query: str, params: Iterable[Any] | Dict[str, Any] = ()
     ) -> Optional[aiosqlite.Row]:
         conn = await self.connect()
-        conn.row_factory = aiosqlite.Row
         async with conn.execute(query, params) as cursor:
             return await cursor.fetchone()
 
@@ -37,9 +40,13 @@ class Database:
         self, query: str, params: Iterable[Any] | Dict[str, Any] = ()
     ) -> List[aiosqlite.Row]:
         conn = await self.connect()
-        conn.row_factory = aiosqlite.Row
         async with conn.execute(query, params) as cursor:
             return await cursor.fetchall()
+
+    async def close(self) -> None:
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None
 
     async def init_db(self):
         await self.execute(
@@ -130,4 +137,30 @@ class Database:
             );
         """
         )
+
+        # Indexes for weak VPS: speed up common lookups. Safe to run on every startup.
+        idx_statements = [
+            "CREATE INDEX IF NOT EXISTS idx_registrations_event_id ON registrations(event_id)",
+            "CREATE INDEX IF NOT EXISTS idx_registrations_user_id ON registrations(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_nodes_parent_order ON nodes(parent_id, order_index)",
+            "CREATE INDEX IF NOT EXISTS idx_nodes_main_menu_order ON nodes(is_main_menu, order_index)",
+            "CREATE INDEX IF NOT EXISTS idx_roles_role ON roles(role)",
+        ]
+        for stmt in idx_statements:
+            try:
+                await self.execute(stmt)
+            except Exception as exc:
+                logging.getLogger("bot").warning("Failed to create index: %s (%s)", stmt, exc)
+
+        # Uniqueness for registrations (protect from duplicates under concurrency).
+        # If duplicates already exist, this must not crash startup.
+        try:
+            await self.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_registrations_user_event ON registrations(user_id, event_id)"
+            )
+        except Exception as exc:
+            logging.getLogger("bot").warning(
+                "Failed to create UNIQUE index uq_registrations_user_event (duplicates?): %s",
+                exc,
+            )
 
