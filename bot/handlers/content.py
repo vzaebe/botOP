@@ -4,12 +4,7 @@ import logging
 from urllib.parse import urlparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 logger = logging.getLogger(__name__)
 
@@ -54,18 +49,12 @@ async def show_node(
         else:
             if child.url and not _is_valid_http_url(child.url):
                 logger.warning("Invalid URL in node id=%s: %r", getattr(child, "id", None), child.url)
-            keyboard.append(
-                [InlineKeyboardButton(child.title, callback_data=f"node_{child.id}")]
-            )
+            keyboard.append([InlineKeyboardButton(child.title, callback_data=f"node_{child.id}")])
 
     if node.parent_id is not None:
-        keyboard.append(
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"node_{node.parent_id}")]
-        )
+        keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data=f"node_{node.parent_id}")])
     elif is_callback:
-        keyboard.append(
-            [InlineKeyboardButton("🔙 В главное меню", callback_data="main_menu_close")]
-        )
+        keyboard.append([InlineKeyboardButton("✖️ Закрыть меню", callback_data="main_menu_close")])
 
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
@@ -87,7 +76,6 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     node_service = context.application.bot_data["node_service"]
 
-    # Simple cache in bot_data to avoid DB query for every message
     cache = context.application.bot_data.get("main_menu_cache")
     if cache is None:
         nodes = await node_service.get_main_menu_nodes()
@@ -107,7 +95,6 @@ async def close_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.delete_message()
     except Exception:  # noqa: BLE001
-        # If we can't delete (permissions/old message), at least remove the keyboard.
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:  # noqa: BLE001
@@ -115,8 +102,5 @@ async def close_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def setup_handlers(application):
-    # Callback to close/delete inline menu
     application.add_handler(CallbackQueryHandler(close_menu, pattern="^main_menu_close$"))
-
-    # Node navigation
     application.add_handler(CallbackQueryHandler(node_view, pattern=r"^node_\d+$"))

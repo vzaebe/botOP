@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+import logging
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    ContextTypes,
-    MessageHandler,
     CallbackQueryHandler,
+    ContextTypes,
     ConversationHandler,
+    MessageHandler,
     filters,
 )
 
@@ -13,25 +15,32 @@ from ..constants import Conversation
 from ..services.messaging import send_main_menu
 from ..utils.errors import ValidationError
 
+logger = logging.getLogger(__name__)
+
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile_service = context.application.bot_data["profile_service"]
+    role_service = context.application.bot_data["role_service"]
     user = await profile_service.get_profile(update.effective_user.id)
     if not user or not user.consent:
-        await update.message.reply_text("Необходимо согласие на обработку ПДн. Нажмите /start.")
+        await update.message.reply_text(
+            "Нужно согласие на обработку данных. Нажмите /start, чтобы продолжить."
+        )
         return ConversationHandler.END
 
+    role = await role_service.get_role(update.effective_user.id)
     text = (
-        f"👤 Профиль\n"
+        "👤 Профиль\n"
         f"Имя: {user.full_name or '—'}\n"
         f"Email: {user.email or '—'}\n"
-        f"Согласие ПДн: {'✅' if user.consent else '❌'}"
+        f"Роль: {role.value}\n"
+        f"Согласие на обработку: {'Да' if user.consent else 'Нет'}"
     )
     kb = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("✏️ Изменить ФИО", callback_data="profile_edit_name")],
-            [InlineKeyboardButton("✏️ Изменить email", callback_data="profile_edit_email")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="profile_back")],
+            [InlineKeyboardButton("✏️ Изменить имя", callback_data="profile_edit_name")],
+            [InlineKeyboardButton("✉️ Изменить email", callback_data="profile_edit_email")],
+            [InlineKeyboardButton("↩️ В меню", callback_data="profile_back")],
         ]
     )
     await update.message.reply_text(text, reply_markup=kb)
@@ -41,14 +50,14 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Введите новое ФИО:")
+    await query.edit_message_text("Введите ваше имя и фамилию:")
     return Conversation.INPUT_NAME
 
 
 async def ask_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Введите новый email:")
+    await query.edit_message_text("Введите ваш email:")
     return Conversation.INPUT_EMAIL
 
 
@@ -57,10 +66,11 @@ async def save_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await profile_service.update_full_name(update.effective_user.id, update.message.text)
         await update.message.reply_text("✅ Имя обновлено.")
+        logger.info("Updated name for user_id=%s", update.effective_user.id)
     except ValidationError as exc:
-        await update.message.reply_text(f"❌ {exc}")
+        await update.message.reply_text(f"⚠️ {exc}")
         return Conversation.INPUT_NAME
-    await send_main_menu(context, update.effective_chat.id)
+    await send_main_menu(context, update.effective_chat.id, text="Профиль обновлен. Что дальше?")
     return ConversationHandler.END
 
 
@@ -68,11 +78,12 @@ async def save_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile_service = context.application.bot_data["profile_service"]
     try:
         await profile_service.update_email(update.effective_user.id, update.message.text)
-        await update.message.reply_text("✅ Email обновлён.")
+        await update.message.reply_text("✅ Email обновлен.")
+        logger.info("Updated email for user_id=%s", update.effective_user.id)
     except ValidationError as exc:
-        await update.message.reply_text(f"❌ {exc}")
+        await update.message.reply_text(f"⚠️ {exc}")
         return Conversation.INPUT_EMAIL
-    await send_main_menu(context, update.effective_chat.id)
+    await send_main_menu(context, update.effective_chat.id, text="Профиль обновлен. Что дальше?")
     return ConversationHandler.END
 
 
@@ -99,4 +110,3 @@ def setup_handlers(application):
     application.add_handler(conv)
     application.add_handler(CallbackQueryHandler(back, pattern="^profile_back$"))
     application.add_handler(MessageHandler(filters.Regex("^👤 Профиль$"), show_profile))
-

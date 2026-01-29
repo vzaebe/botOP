@@ -16,6 +16,7 @@ def setup_logging(
     max_bytes: int = 5 * 1024 * 1024,
     backup_count: int = 3,
 ) -> logging.Logger:
+    """Configure console + rotating file logging for the whole project."""
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
 
     if log_file:
@@ -31,11 +32,15 @@ def setup_logging(
             )
         )
 
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=handlers,
-    )
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    for handler in handlers:
+        handler.setFormatter(formatter)
+
+    logging.basicConfig(level=level, handlers=handlers, force=True)
+    logging.captureWarnings(True)
+
+    logger.setLevel(level)
+    logger.debug("Logging configured (level=%s, file=%s)", level, log_file)
     return logger
 
 

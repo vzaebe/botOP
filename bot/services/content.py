@@ -2,24 +2,24 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from ..models import ContentSection, MenuItem, Template
 from ..logging_config import logger
-
+from ..models import ContentSection, MenuItem, Template
+from .messaging import MENU_LABEL_EVENTS, MENU_LABEL_PROFILE
 
 DEFAULT_SECTIONS = {
-    "links": ("🔗 Полезные ссылки", "Добавьте ссылки в админке"),
-    "podcasts": ("🎧 Подкасты", "Добавьте подкасты в админке"),
+    "links": ("Полезные ссылки", "Собрали ссылки на наши ресурсы и материалы."),
+    "podcasts": ("Подкасты", "Подборка выпусков и интервью, которые стоит послушать."),
 }
 
 DEFAULT_MENU = [
-    ("events", "📋 Мероприятия", 1),
-    ("profile", "👤 Профиль", 2),
-    ("info", "ℹ️ Инфо", 3),
+    ("events", MENU_LABEL_EVENTS, 1),
+    ("profile", MENU_LABEL_PROFILE, 2),
+    ("info", "ℹ️ Информация", 3),
 ]
 
 DEFAULT_TEMPLATES = {
-    "registration_success": "🎉 Вы зарегистрированы на {event_name}\nДата: {event_datetime}",
-    "reminder": "⏰ Напоминание о событии {event_name}",
+    "registration_success": "✅ Вы записаны на {event_name}\nДата и время: {event_datetime}",
+    "reminder": "⏰ Напоминание: скоро {event_name}",
 }
 
 
@@ -28,19 +28,23 @@ class ContentService:
         self.repo = repo
 
     async def ensure_defaults(self):
-        # populate sections if empty
         existing = await self.repo.list_sections()
         if not existing:
             for key, (title, body) in DEFAULT_SECTIONS.items():
                 await self.repo.upsert_section(ContentSection(key=key, title=title, body=body))
+            logger and logger.info("Default content sections created")
+
         menu = await self.repo.list_menu_items()
         if not menu:
             for key, title, pos in DEFAULT_MENU:
                 await self.repo.upsert_menu_item(MenuItem(key=key, title=title, position=pos))
+            logger and logger.info("Default menu items created")
+
         templates = await self.repo.list_templates()
         if not templates:
             for key, body in DEFAULT_TEMPLATES.items():
                 await self.repo.upsert_template(Template(key=key, body=body))
+            logger and logger.info("Default templates created")
 
     async def list_sections(self) -> List[ContentSection]:
         return await self.repo.list_sections()
@@ -71,4 +75,3 @@ class ContentService:
 
     async def save_template(self, key: str, body: str):
         await self.repo.upsert_template(Template(key=key, body=body))
-

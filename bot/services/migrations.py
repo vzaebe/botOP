@@ -4,9 +4,9 @@ import json
 import os
 from datetime import datetime
 
-from ..models import ContentSection, MenuItem, Template, Event, Registration, User
-from ..logging_config import logger
 from ..constants import Role
+from ..logging_config import logger
+from ..models import ContentSection, Event, MenuItem, Registration, Template, User
 
 
 class MigrationService:
@@ -22,6 +22,23 @@ class MigrationService:
         # User can delete this marker to force re-run migration.
         return os.path.join("data", ".legacy_migration_done")
 
+    def _legacy_files_changed(self, marker: str, files: list[str]) -> bool:
+        if not os.path.exists(marker):
+            return True
+        try:
+            marker_mtime = os.path.getmtime(marker)
+        except OSError:
+            return True
+        for path in files:
+            if not os.path.exists(path):
+                continue
+            try:
+                if os.path.getmtime(path) > marker_mtime:
+                    return True
+            except OSError:
+                return True
+        return False
+
     async def migrate_from_files(
         self,
         events_file: str = "events.xlsx",
@@ -29,39 +46,42 @@ class MigrationService:
         users_file: str = "bot_users.json",
     ):
         marker = self._migration_marker_path()
-        if os.path.exists(marker):
+        legacy_files = [events_file, registrations_file, users_file]
+        if not any(os.path.exists(path) for path in legacy_files):
             return
-
-        if not (os.path.exists(events_file) or os.path.exists(registrations_file) or os.path.exists(users_file)):
+        if not self._legacy_files_changed(marker, legacy_files):
             return
 
         # Heavy dependency: import lazily to keep bot startup fast on weak VPS.
         import pandas as pd
 
         logger and logger.info("Starting migration from legacy files...")
+        had_errors = False
 
-        # Users
         if os.path.exists(users_file):
-            with open(users_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for uid_str, info in data.items():
-                user_id = int(uid_str)
-                user = User(
-                    user_id=user_id,
-                    username=info.get("username", ""),
-                    full_name=info.get("name", ""),
-                    email=info.get("email", ""),
-                    consent=False,
-                    consent_time=None,
-                    created_at=info.get("first_seen"),
-                    updated_at=info.get("first_seen"),
-                )
-                await self.user_repo.upsert_user(user.user_id, user.username, user.full_name)
-                await self.user_repo.set_email(user.user_id, user.email)
-                await self.role_repo.set_role(user.user_id, Role.USER)
-            logger and logger.info("Users migrated: %s", len(data))
+            try:
+                with open(users_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for uid_str, info in data.items():
+                    user_id = int(uid_str)
+                    user = User(
+                        user_id=user_id,
+                        username=info.get("username", ""),
+                        full_name=info.get("name", ""),
+                        email=info.get("email", ""),
+                        consent=False,
+                        consent_time=None,
+                        created_at=info.get("first_seen"),
+                        updated_at=info.get("first_seen"),
+                    )
+                    await self.user_repo.upsert_user(user.user_id, user.username, user.full_name)
+                    await self.user_repo.set_email(user.user_id, user.email)
+                    await self.role_repo.set_role(user.user_id, Role.USER)
+                logger and logger.info("Users migrated: %s", len(data))
+            except Exception as exc:
+                had_errors = True
+                logger and logger.error("Failed to migrate users: %s", exc)
 
-        # Events
         if os.path.exists(events_file):
             try:
                 df_events = pd.read_excel(events_file)
@@ -75,10 +95,11 @@ class MigrationService:
                     )
                     if not await self.event_repo.get(event.event_id):
                         await self.event_repo.add(event)
+                logger and logger.info("Events migrated from %s", events_file)
             except Exception as exc:
+                had_errors = True
                 logger and logger.error("Failed to migrate events: %s", exc)
 
-        # Registrations
         if os.path.exists(registrations_file):
             try:
                 df_reg = pd.read_excel(registrations_file)
@@ -94,13 +115,17 @@ class MigrationService:
                     existing = await self.reg_repo.get(reg.user_id, reg.event_id)
                     if not existing:
                         await self.reg_repo.create(reg)
+                logger and logger.info("Registrations migrated from %s", registrations_file)
             except Exception as exc:
+                had_errors = True
                 logger and logger.error("Failed to migrate registrations: %s", exc)
 
         await self.ensure_defaults()
+        if had_errors:
+            logger and logger.warning("Migration finished with errors; marker not updated.")
+            return
         logger and logger.info("Migration done.")
 
-        # Mark successful migration to avoid re-reading heavy legacy files on every restart.
         try:
             os.makedirs(os.path.dirname(marker), exist_ok=True)
             with open(marker, "w", encoding="utf-8") as f:
@@ -109,24 +134,22 @@ class MigrationService:
             logger and logger.warning("Failed to write migration marker %s: %s", marker, exc)
 
     async def ensure_defaults(self):
-        # fallback content
         existing = await self.content_repo.list_sections()
         if not existing:
             await self.content_repo.upsert_section(
                 ContentSection(
                     key="knowledge_base",
-                    title="📚 База знаний",
-                    body="Добавьте текст в админке.",
+                    title="База знаний",
+                    body="Собираем полезные материалы и ссылки в одном месте.",
                 )
             )
         menu = await self.content_repo.list_menu_items()
         if not menu:
-            await self.content_repo.upsert_menu_item(MenuItem(key="events", title="📋 Мероприятия", position=1))
+            await self.content_repo.upsert_menu_item(MenuItem(key="events", title="📅 Мероприятия", position=1))
             await self.content_repo.upsert_menu_item(MenuItem(key="profile", title="👤 Профиль", position=2))
-            await self.content_repo.upsert_menu_item(MenuItem(key="info", title="ℹ️ Инфо", position=3))
+            await self.content_repo.upsert_menu_item(MenuItem(key="info", title="ℹ️ Информация", position=3))
         templates = await self.content_repo.list_templates()
         if not templates:
             await self.content_repo.upsert_template(
-                Template(key="registration_success", body="🎉 Регистрация на {event_name}")
+                Template(key="registration_success", body="✅ Вы записаны на {event_name}")
             )
-

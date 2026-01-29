@@ -1,74 +1,98 @@
 from __future__ import annotations
-from telegram.ext import Application, ApplicationBuilder
 
-from .config import load_config
-from .logging_config import setup_logging
-from .storage.db import Database
-from .storage.repositories.users import UserRepository
-from .storage.repositories.roles import RoleRepository
-from .storage.repositories.events import EventRepository
-from .storage.repositories.registrations import RegistrationRepository
-from .storage.repositories.content import ContentRepository
-from .storage.repositories.nodes import NodeRepository
-from .services.profiles import ProfileService
-from .services.events import EventService
-from .services.content import ContentService
-from .services.nodes import NodeService
-from .constants import Role
-from .services.migrations import MigrationService
-from .services.restart import RestartService
-from .handlers import start as start_handlers
-from .handlers import profile as profile_handlers
-from .handlers import events as events_handlers
-from .handlers import admin as admin_handlers
-from .handlers import content as content_handlers
-from .handlers import menu as menu_handlers
-from .services.messaging import send_main_menu
-from .utils.errors import PermissionDenied
 import logging
 import time
 
+from telegram.ext import Application, ApplicationBuilder
+
+from .config import load_config
+from .constants import Role
+from .handlers import admin as admin_handlers
+from .handlers import content as content_handlers
+from .handlers import events as events_handlers
+from .handlers import menu as menu_handlers
+from .handlers import profile as profile_handlers
+from .handlers import start as start_handlers
+from .logging_config import setup_logging
+from .services.content import ContentService
+from .services.events import EventService
+from .services.migrations import MigrationService
+from .services.nodes import NodeService
+from .services.profiles import ProfileService
+from .services.restart import RestartService
+from .storage.db import Database
+from .storage.repositories.content import ContentRepository
+from .storage.repositories.events import EventRepository
+from .storage.repositories.nodes import NodeRepository
+from .storage.repositories.registrations import RegistrationRepository
+from .storage.repositories.roles import RoleRepository
+from .storage.repositories.users import UserRepository
+from .utils.errors import PermissionDenied
+
+logger = logging.getLogger(__name__)
+
 
 async def on_startup(app: Application):
-    # for uptime/diagnostics
+    logger.info("Bootstrapping bot...")
     app.bot_data.setdefault("started_at", time.time())
     config = app.bot_data["config"]
     db: Database = app.bot_data["db"]
-    await db.init_db()
-    # migrate
+
+    try:
+        await db.init_db()
+        logger.info("Database initialized at %s", db.path)
+    except Exception:
+        logger.exception("Failed to initialize database")
+        raise
+
     migrator: MigrationService = app.bot_data["migrator"]
-    await migrator.migrate_from_files()
+    try:
+        await migrator.migrate_from_files()
+    except Exception:
+        logger.exception("Migration failed; continuing without legacy import")
+
     content_service: ContentService = app.bot_data["content_service"]
-    await content_service.ensure_defaults()
     node_service: NodeService = app.bot_data["node_service"]
-    await node_service.ensure_defaults()
-    # grant admin roles from config
+    try:
+        await content_service.ensure_defaults()
+        await node_service.ensure_defaults()
+    except Exception:
+        logger.exception("Failed to ensure default content or nodes")
+
     profile_service = app.bot_data["profile_service"]
     for admin_id in config.admin_ids:
-        # гарантируем запись пользователя, иначе FK на roles упадёт
         await profile_service.ensure_user(admin_id, username="", full_name=f"admin-{admin_id}")
         await profile_service.assign_role(admin_id, Role.ADMIN)
+        logger.info("Granted admin role from config to user_id=%s", admin_id)
 
 
 async def on_shutdown(app: Application):
     db: Database = app.bot_data.get("db")
     if db:
         await db.close()
+        logger.info("Database connection closed")
+    logger.info("Bot shutdown complete")
 
 
 async def on_error(update, context):
     err = context.error
-    logging.exception("Handler error: %s", err)
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+    logger.exception("Handler error (chat_id=%s): %s", chat_id, err)
     if update and update.effective_message:
-        if isinstance(err, PermissionDenied):
-            await update.effective_message.reply_text("⛔ Нет доступа")
-        else:
-            await update.effective_message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
+        try:
+            if isinstance(err, PermissionDenied):
+                await update.effective_message.reply_text("⛔ Недостаточно прав для этой команды.")
+            else:
+                await update.effective_message.reply_text(
+                    "⚠️ Что-то пошло не так. Я уже записал ошибку в лог и попробую работать дальше."
+                )
+        except Exception:
+            logger.exception("Failed to send error message to chat_id=%s", chat_id)
 
 
 def build_application() -> Application:
     config = load_config()
-    logger = setup_logging(
+    setup_logging(
         config.log_level,
         log_file=config.log_file,
         max_bytes=config.log_max_bytes,
@@ -105,7 +129,10 @@ def build_application() -> Application:
     app.bot_data["node_service"] = node_service
     app.bot_data["migrator"] = migrator
     app.bot_data["role_service"] = profile_service  # reuse profile service for role ops
-    app.bot_data["restart_service"] = RestartService(enabled=config.restart_enabled)
+    app.bot_data["restart_service"] = RestartService(
+        enabled=config.restart_enabled,
+        exit_code=config.restart_exit_code,
+    )
     app.bot_data["started_at"] = started_at
 
     start_handlers.setup_handlers(app)
@@ -116,7 +143,7 @@ def build_application() -> Application:
     menu_handlers.setup_handlers(app)
     app.add_error_handler(on_error)
     logger.info(
-        "Bot initialized (log_level=%s, db=%s, admins=%s, restart=%s)",
+        "Bot initialized (log_level=%s, db=%s, admins=%s, restart_enabled=%s)",
         config.log_level,
         config.database_path,
         len(config.admin_ids),
@@ -127,9 +154,9 @@ def build_application() -> Application:
 
 def main():
     application = build_application()
+    logger.info("Starting polling...")
     application.run_polling()
 
 
 if __name__ == "__main__":
     main()
-

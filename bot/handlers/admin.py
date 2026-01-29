@@ -19,6 +19,7 @@ from telegram.ext import (
 
 from ..constants import Conversation, Role
 from ..keyboards.admin import admin_panel_kb, cancel_keyboard, confirm_keyboard
+from ..services.messaging import ADMIN_BUTTON_TEXT
 from ..services.permissions import require_role
 from ..utils.errors import ValidationError
 from ..utils.validators import parse_int
@@ -74,6 +75,7 @@ async def admin_login_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile_service = context.application.bot_data["profile_service"]
     await profile_service.assign_role(update.effective_user.id, Role.ADMIN)
     await update.message.reply_text("✅ Роль admin выдана.", reply_markup=admin_panel_kb())
+    logger and logger.info("Admin access granted to user_id=%s", update.effective_user.id)
     return ConversationHandler.END
 
 
@@ -347,6 +349,13 @@ async def add_event_seats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return Conversation.WAITING_EVENT_SEATS
         return Conversation.WAITING_EVENT_NAME
     await update.message.reply_text(f"✅ Добавлено: {ev.name}")
+    logger and logger.info(
+        "Admin %s created event id=%s name=%s seats=%s",
+        update.effective_user.id,
+        getattr(ev, "event_id", None),
+        ev.name,
+        ev.max_seats,
+    )
     await update.message.reply_text("Админ-панель", reply_markup=admin_panel_kb())
     return ConversationHandler.END
 
@@ -400,6 +409,9 @@ async def edit_event_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {exc}")
         return Conversation.EDIT_EVENT_VALUE
     await update.message.reply_text("Обновлено", reply_markup=admin_panel_kb())
+    logger and logger.info(
+        "Admin %s updated event %s field=%s", update.effective_user.id, event_id, field
+    )
     return ConversationHandler.END
 
 
@@ -431,6 +443,7 @@ async def delete_event_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
     event_id = query.data.replace("admin_delete_go_", "")
     await context.application.bot_data["event_service"].delete_event(event_id)
     await query.edit_message_text("Удалено", reply_markup=admin_panel_kb())
+    logger and logger.info("Admin %s deleted event %s", query.from_user.id, event_id)
 
 
 @require_role(Role.MODERATOR)
@@ -464,6 +477,7 @@ async def remind_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as exc:  # noqa: BLE001
             logger and logger.warning("Reminder failed for %s: %s", reg.user_id, exc)
     await query.edit_message_text(f"Напоминания отправлены: {sent}", reply_markup=admin_panel_kb())
+    logger and logger.info("Reminder sent for event %s to %s users", event_id, sent)
 
 
 @require_role(Role.MODERATOR)
@@ -497,6 +511,7 @@ async def broadcast_all_send(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as exc:  # noqa: BLE001
             logger and logger.warning("Broadcast fail %s: %s", u.user_id, exc)
     await query.edit_message_text(f"Рассылка завершена. Доставлено: {sent}", reply_markup=admin_panel_kb())
+    logger and logger.info("Broadcast to all finished by user_id=%s delivered=%s", query.from_user.id, sent)
     return ConversationHandler.END
 
 
@@ -542,11 +557,13 @@ async def broadcast_event_send(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as exc:  # noqa: BLE001
             logger and logger.warning("Broadcast event fail %s: %s", reg.user_id, exc)
     await query.edit_message_text(f"Рассылка по событию завершена. Доставлено: {sent}", reply_markup=admin_panel_kb())
+    logger and logger.info(
+        "Broadcast to event %s finished by user_id=%s delivered=%s", event_id, query.from_user.id, sent
+    )
     return ConversationHandler.END
 
 
 # Node CMS
-@require_role(Role.ADMIN)
 async def _node_cms_render(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
     node_service = context.application.bot_data["node_service"]
     # Show root nodes (where parent_id is NULL)
@@ -571,8 +588,11 @@ async def node_cms_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _node_cms_render(update, context, query)
 
 
-@require_role(Role.ADMIN)
-async def _adm_node_view_render(query, context: ContextTypes.DEFAULT_TYPE, node_id: int):
+async def _adm_node_view_render(update: Update, context: ContextTypes.DEFAULT_TYPE, node_id: int):
+    query = update.callback_query
+    if not query:
+        return
+
     node_service = context.application.bot_data["node_service"]
     node = await node_service.get_node(node_id)
     children = await node_service.get_children(node_id)
@@ -599,6 +619,7 @@ async def _adm_node_view_render(query, context: ContextTypes.DEFAULT_TYPE, node_
     rows.append([InlineKeyboardButton("➕ Добавить подраздел", callback_data=f"adm_node_add_{node_id}")])
     rows.append([
         InlineKeyboardButton("✏️ Текст/Назв", callback_data=f"adm_node_edit_{node_id}"),
+        InlineKeyboardButton("↗️ Перенести", callback_data=f"adm_node_reparent_{node_id}"),
         InlineKeyboardButton("🗑 Удалить", callback_data=f"adm_node_del_{node_id}")
     ])
 
@@ -614,12 +635,83 @@ async def _adm_node_view_render(query, context: ContextTypes.DEFAULT_TYPE, node_
     )
 
 
+def _collect_descendants(root_id: int, nodes) -> set[int]:
+    tree: dict[int | None, list] = {}
+    for n in nodes:
+        tree.setdefault(n.parent_id, []).append(n)
+    descendants: set[int] = set()
+    stack = [root_id]
+    while stack:
+        current = stack.pop()
+        for child in tree.get(current, []):
+            if child.id is None or child.id in descendants:
+                continue
+            descendants.add(child.id)
+            stack.append(child.id)
+    descendants.discard(root_id)
+    return descendants
+
+
+@require_role(Role.ADMIN)
+async def adm_node_reparent_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    node_id = int(query.data.replace("adm_node_reparent_", ""))
+    node_service = context.application.bot_data["node_service"]
+    nodes = await node_service.get_all_nodes()
+    descendants = _collect_descendants(node_id, nodes)
+
+    keyboard: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("⬆️ В корень", callback_data=f"adm_node_reparent_pick_{node_id}_root")]
+    ]
+    for n in nodes:
+        if n.id in (None, node_id) or n.id in descendants:
+            continue
+        keyboard.append(
+            [InlineKeyboardButton(f"{n.title} (id={n.id})", callback_data=f"adm_node_reparent_pick_{node_id}_{n.id}")]
+        )
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"adm_node_view_{node_id}")])
+    await query.edit_message_text("Выберите новый родитель для раздела:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+@require_role(Role.ADMIN)
+async def adm_node_reparent_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    payload = query.data.replace("adm_node_reparent_pick_", "")
+    parts = payload.split("_", 1)
+    node_id = int(parts[0])
+    parent_raw = parts[1] if len(parts) > 1 else "root"
+    parent_id = None if parent_raw == "root" else int(parent_raw)
+
+    node_service = context.application.bot_data["node_service"]
+    node = await node_service.get_node(node_id)
+    if not node:
+        await query.edit_message_text("Раздел не найден.")
+        return ConversationHandler.END
+
+    await node_service.save_node(
+        node_id=node.id,
+        parent_id=parent_id,
+        key=node.key,
+        title=node.title,
+        content=node.content,
+        url=node.url,
+        order_index=node.order_index,
+        is_main_menu=node.is_main_menu,
+    )
+    context.application.bot_data.pop("main_menu_cache", None)
+    await query.edit_message_text("✅ Сохранено. Обновляю структуру...")
+    await _adm_node_view_render(update, context, node_id)
+    return ConversationHandler.END
+
+
 @require_role(Role.ADMIN)
 async def adm_node_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     node_id = int(query.data.replace("adm_node_view_", ""))
-    await _adm_node_view_render(query, context, node_id)
+    await _adm_node_view_render(update, context, node_id)
 
 
 @require_role(Role.ADMIN)
@@ -782,7 +874,7 @@ async def adm_node_delete_confirm(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text("🗑 Удалено")
     
     if parent_id is not None:
-        await _adm_node_view_render(query, context, parent_id)
+        await _adm_node_view_render(update, context, parent_id)
     else:
         await _node_cms_render(update, context, query)
     return ConversationHandler.END
@@ -790,6 +882,32 @@ async def adm_node_delete_confirm(update: Update, context: ContextTypes.DEFAULT_
 
 # Roles
 @require_role(Role.ADMIN)
+
+
+@require_role(Role.ADMIN)
+async def admin_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("??????? ???????? user_id ?????? ??????:", reply_markup=cancel_keyboard())
+    return Conversation.ADMIN_ADD_ID
+
+
+@require_role(Role.ADMIN)
+async def admin_add_admin_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = int(update.message.text.strip())
+    except Exception:
+        await update.message.reply_text("??????? ?????????? user_id (?????).", reply_markup=cancel_keyboard())
+        return Conversation.ADMIN_ADD_ID
+
+    profile_service = context.application.bot_data["profile_service"]
+    cfg = context.application.bot_data.get("config")
+    await profile_service.ensure_user(user_id, username="", full_name=f"admin-{user_id}")
+    await profile_service.assign_role(user_id, Role.ADMIN)
+    if cfg and user_id not in cfg.admin_ids:
+        cfg.admin_ids.append(user_id)
+    await update.message.reply_text("? ????? ????????.", reply_markup=admin_panel_kb())
+    return ConversationHandler.END
 async def roles_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -846,6 +964,7 @@ async def role_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile_service = context.application.bot_data["profile_service"]
     await profile_service.assign_role(uid, Role(role_name))
     await query.edit_message_text("Роль обновлена", reply_markup=admin_panel_kb())
+    logger and logger.info("Admin %s set role %s for user %s", query.from_user.id, role_name, uid)
 
 
 @require_role(Role.ADMIN)
@@ -855,6 +974,7 @@ async def reload_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     restart_service = context.application.bot_data["restart_service"]
     await restart_service.reload_data(context)
     await query.edit_message_text("Данные перечитаны", reply_markup=admin_panel_kb())
+    logger and logger.info("Admin %s requested data reload", query.from_user.id)
 
 
 @require_role(Role.ADMIN)
@@ -862,7 +982,8 @@ async def restart_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     restart_service = context.application.bot_data["restart_service"]
-    await restart_service.schedule_restart(update, context, code=0)
+    await restart_service.schedule_restart(update, context)
+    logger and logger.info("Admin %s requested restart", query.from_user.id)
 
 
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -924,6 +1045,7 @@ def setup_handlers(application):
             CallbackQueryHandler(broadcast_event_pick, pattern="^admin_broadcast_pick_.*$"),
             CallbackQueryHandler(adm_node_add, pattern="^adm_node_add_.*$"),
             CallbackQueryHandler(adm_node_edit, pattern="^adm_node_edit_.*$"),
+            CallbackQueryHandler(admin_add_admin_start, pattern="^admin_add_admin$"),
         ],
         states={
             Conversation.WAITING_ADMIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_login_check)],
@@ -965,6 +1087,7 @@ def setup_handlers(application):
                 CallbackQueryHandler(admin_panel_from_conv, pattern="^admin_panel$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/skip$"), adm_node_order_input),
             ],
+            Conversation.ADMIN_ADD_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_admin_apply)],
             Conversation.NODE_EDIT_IS_MAIN: [
                 CallbackQueryHandler(adm_node_cancel, pattern="^adm_node_cancel$"),
                 CallbackQueryHandler(adm_node_view_from_conv, pattern="^adm_node_view_.*$"),
@@ -977,7 +1100,7 @@ def setup_handlers(application):
         per_user=True,
     )
     application.add_handler(conv)
-    application.add_handler(MessageHandler(filters.Regex("^⚙️ Админка$"), admin_entry))
+    application.add_handler(MessageHandler(filters.Regex(f"^{ADMIN_BUTTON_TEXT}$"), admin_entry))
     application.add_handler(CommandHandler("admin_status", admin_status_cmd))
     application.add_handler(CommandHandler("admin_health", admin_health_cmd))
     application.add_handler(CommandHandler("admin_logs", admin_logs_cmd))
@@ -997,6 +1120,8 @@ def setup_handlers(application):
     application.add_handler(CallbackQueryHandler(node_cms_start, pattern="^admin_cms$"))
     application.add_handler(CallbackQueryHandler(node_cms_start, pattern="^admin_menu$"))
     application.add_handler(CallbackQueryHandler(adm_node_view, pattern="^adm_node_view_.*$"))
+    application.add_handler(CallbackQueryHandler(adm_node_reparent_start, pattern="^adm_node_reparent_.*$"))
+    application.add_handler(CallbackQueryHandler(adm_node_reparent_apply, pattern="^adm_node_reparent_pick_.*$"))
     application.add_handler(CallbackQueryHandler(adm_node_delete, pattern=r"^adm_node_del_(\d+)$"))
     application.add_handler(CallbackQueryHandler(adm_node_delete_confirm, pattern="^adm_node_del_confirm_.*$"))
     

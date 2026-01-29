@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import List, Optional
+
+from ..logging_config import logger
 from ..models import Node
 
 
@@ -38,10 +40,13 @@ class NodeService:
             order_index=order_index,
             is_main_menu=is_main_menu,
         )
-        return await self.repo.upsert_node(node)
+        node_id = await self.repo.upsert_node(node)
+        logger and logger.debug("Saved node id=%s key=%s parent=%s", node_id, key, parent_id)
+        return node_id
 
     async def delete_node(self, node_id: int):
         await self.repo.delete_node(node_id)
+        logger and logger.info("Deleted node id=%s", node_id)
 
     async def get_all_nodes(self) -> List[Node]:
         return await self.repo.list_all_nodes()
@@ -50,29 +55,29 @@ class NodeService:
         return await self.repo.get_main_menu_nodes()
 
     async def ensure_defaults(self):
-        # Initial setup if empty
         nodes = await self.get_all_nodes()
-        if not nodes:
-            # Main Info Node
-            info_id = await self.save_node(
-                title="ℹ️ Инфо",
-                content="Выберите интересующий раздел:",
-                key="info",
-                order_index=3,
-                is_main_menu=True,
-            )
-            # Example child nodes
-            await self.save_node(
-                parent_id=info_id,
-                title="🔗 Ссылки",
-                content="Наши полезные ссылки:",
-                key="links",
-                order_index=1,
-            )
-            await self.save_node(
-                parent_id=info_id,
-                title="🎧 Подкасты",
-                content="Слушайте наши подкасты здесь:",
-                key="podcasts",
-                order_index=2,
-            )
+        if nodes:
+            return
+
+        info_id = await self.save_node(
+            title="ℹ️ Информация",
+            content="Быстрые ссылки по разделам:",
+            key="info",
+            order_index=3,
+            is_main_menu=True,
+        )
+        await self.save_node(
+            parent_id=info_id,
+            title="Полезные ссылки",
+            content="Список ссылок:",
+            key="links",
+            order_index=1,
+        )
+        await self.save_node(
+            parent_id=info_id,
+            title="Подкасты",
+            content="Свежие выпуски и интервью:",
+            key="podcasts",
+            order_index=2,
+        )
+        logger and logger.info("Default nodes created")

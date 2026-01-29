@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from bot.constants import Role
-from bot.services.messaging import send_main_menu
+from bot.services.messaging import ADMIN_BUTTON_TEXT, send_main_menu
 from bot.services.permissions import has_role, require_role
 from bot.utils.errors import PermissionDenied
 
@@ -26,7 +26,6 @@ async def test_require_role_allows_and_denies(context, services):
         called["ok"] += 1
         return "ok"
 
-    # Ensure user exists for FK on roles, and keep default role USER
     await services.profile.ensure_user(1, "u", "User One")
     update = make_message_update(1, text="hi")
 
@@ -43,16 +42,28 @@ async def test_require_role_allows_and_denies(context, services):
 async def test_send_main_menu_includes_admin_button_for_admin(context, services, seeded_nodes):
     await services.profile.ensure_user(1, "u", "User One")
 
-    # USER: no admin button
     await send_main_menu(context, chat_id=1, text="menu")
     kb = context.bot.sent_messages[-1]["reply_markup"]
     rows = [[btn.text for btn in row] for row in kb.keyboard]
-    assert "⚙️ Админка" not in [t for row in rows for t in row]
+    assert ADMIN_BUTTON_TEXT not in [t for row in rows for t in row]
 
-    # ADMIN: admin button present
     await services.profile.assign_role(1, Role.ADMIN)
     await send_main_menu(context, chat_id=1, text="menu")
     kb2 = context.bot.sent_messages[-1]["reply_markup"]
     rows2 = [[btn.text for btn in row] for row in kb2.keyboard]
-    assert "⚙️ Админка" in [t for row in rows2 for t in row]
+    assert ADMIN_BUTTON_TEXT in [t for row in rows2 for t in row]
 
+
+@pytest.mark.asyncio
+async def test_require_role_auto_grants_config_admin(context, services):
+    # Emulate ADMIN_IDS containing the user
+    context.application.bot_data["config"].admin_ids = [1]
+
+    @require_role(Role.ADMIN)
+    async def handler(update, ctx):
+        return "ok"
+
+    update = make_message_update(1, text="hi")
+    res = await handler(update, context)
+    assert res == "ok"
+    assert (await services.profile.get_role(1)) == Role.ADMIN

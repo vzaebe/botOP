@@ -19,6 +19,7 @@ class Config:
     log_max_bytes: int = 5 * 1024 * 1024
     log_backup_count: int = 3
     restart_enabled: bool = True
+    restart_exit_code: int = 1
 
 
 def _parse_admin_ids(raw: str) -> List[int]:
@@ -54,6 +55,15 @@ def _parse_int(raw: str | None, default: int) -> int:
         return default
 
 
+def _resolve_path(path: str) -> str:
+    if not path or path == ":memory:":
+        return path
+    if os.path.isabs(path):
+        return path
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    return os.path.abspath(os.path.join(base_dir, path))
+
+
 def load_config() -> Config:
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
@@ -66,14 +76,17 @@ def load_config() -> Config:
         raise RuntimeError("ADMIN_PASSWORD is required. Set it in .env")
 
     personal_link = os.getenv("PERSONAL_DATA_LINK", "<ВСТАВЬТЕ_ССЫЛКУ_ТУТ>")
-    db_path = os.getenv("DATABASE_PATH", os.path.join("data", "bot.db"))
+    db_path = _resolve_path(os.getenv("DATABASE_PATH", os.path.join("data", "bot.db")))
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     log_file = os.getenv("LOG_FILE", os.path.join("data", "bot.log"))
     log_max_bytes = _parse_int(os.getenv("LOG_MAX_BYTES"), 5 * 1024 * 1024)
     log_backup_count = _parse_int(os.getenv("LOG_BACKUP_COUNT"), 3)
     restart_enabled = _parse_bool(os.getenv("RESTART_ENABLED", "true"), default=True)
+    restart_exit_code = _parse_int(os.getenv("RESTART_EXIT_CODE"), 1)
 
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
 
     return Config(
         bot_token=token,
@@ -86,5 +99,6 @@ def load_config() -> Config:
         log_max_bytes=log_max_bytes,
         log_backup_count=log_backup_count,
         restart_enabled=restart_enabled,
+        restart_exit_code=restart_exit_code,
     )
 

@@ -36,4 +36,5 @@ class Conversation(IntEnum):
     NODE_EDIT_URL = 25
     NODE_EDIT_ORDER = 26
     NODE_EDIT_IS_MAIN = 27
+    ADMIN_ADD_ID = 28
 
